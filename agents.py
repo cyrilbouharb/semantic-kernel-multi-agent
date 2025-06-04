@@ -1,252 +1,191 @@
 import asyncio
 import os
-import textwrap
-from datetime import datetime
-from pathlib import Path
-import shutil
-
 from azure.identity.aio import DefaultAzureCredential
-from semantic_kernel.agents import AgentGroupChat
-from semantic_kernel.agents import AzureAIAgent, AzureAIAgentSettings
+from semantic_kernel.agents import AgentGroupChat, AzureAIAgent, AzureAIAgentSettings
 from semantic_kernel.agents.strategies import TerminationStrategy, SequentialSelectionStrategy
 from semantic_kernel.contents.chat_message_content import ChatMessageContent
 from semantic_kernel.contents.utils.author_role import AuthorRole
 from semantic_kernel.functions.kernel_function_decorator import kernel_function
 
-INCIDENT_MANAGER = "INCIDENT_MANAGER"
-INCIDENT_MANAGER_INSTRUCTIONS = """
-Analyze the given log file or the response from the devops assistant.
-Recommend which one of the following actions should be taken:
+# Agent Names
+GENERAL = "GeneralAgent"
+CALL_CENTER = "CallCenterAgent"
+TRANSLATION = "TranslationAgent"
+DOCUMENT = "DocumentAgent"
+FABRIC = "FabricDataAgent"
+POWERBI = "PowerBIReportingAgent"
+PMO = "PMOAgent"
 
-Restart service {service_name}
-Rollback transaction
-Redeploy resource {resource_name}
-Increase quota
+# Agent Instructions
+GENERAL_INSTRUCTIONS = "Handle general inquiries about application status, service info, or other citizen requests not related to translation or documents."
 
-If there are no issues or if the issue has already been resolved, respond with "INCIDENT_MANAGER > No action needed."
-If none of the options resolve the issue, respond with "Escalate issue."
-
-RULES:
-- Do not perform any corrective actions yourself.
-- Read the log file on every turn.
-- Prepend your response with this text: "INCIDENT_MANAGER > {logfilepath} | "
-- Only respond with the corrective action instructions.
+CALL_CENTER_INSTRUCTIONS = """
+You are the first point of contact for citizens. 
+Identify if the query is a document, a translation request, or a general question.
+Return the name of the agent to route to: DocumentAgent, TranslationAgent, or General.
+Do not ask follow-up questions. Just return the route.
 """
 
-DEVOPS_ASSISTANT = "DEVOPS_ASSISTANT"
-DEVOPS_ASSISTANT_INSTRUCTIONS = """
-Read the instructions from the INCIDENT_MANAGER and apply the appropriate resolution function. 
-Return the response as "{function_response}"
-If the instructions indicate there are no issues or actions needed, 
-take no action and respond with "No action needed."
+TRANSLATION_INSTRUCTIONS = "Translate between Arabic and English. Maintain context and accuracy."
+DOCUMENT_INSTRUCTIONS = "Extract structured data from documents (PDFs, images, forms)."
+FABRIC_INSTRUCTIONS = "Store structured data and prepare it for analysis."
+POWERBI_INSTRUCTIONS = "Generate dashboards and reports from Fabric data."
+PMO_INSTRUCTIONS = "Log all interactions and trigger workflows. Maintain audit trails."
 
-RULES:
-- Use the instructions provided.
-- Do not read any log files yourself.
-- Prepend your response with this text: "DEVOPS_ASSISTANT > "
-"""
+# Plugins
+class GeneralPlugin:
+    @kernel_function(description="Handles general citizen queries")
+    def handle_general_query(self, query: str = "") -> str:
+        # Customize logic as needed
+        if "status" in query.lower():
+            return "You can find your application status on the citizen portal or by contacting support."
+        return "Thank you for your inquiry. We will get back to you soon."
 
+class CallCenterPlugin:
+    @kernel_function(description="Routes citizen queries to appropriate agents")
+    def route_query(self, query: str = "") -> str:
+        if "document" in query.lower():
+            return "DocumentAgent"
+        elif "arabic" in query.lower() or "translate" in query.lower():
+            return "TranslationAgent"
+        return "General"
+
+class TranslationPlugin:
+    @kernel_function(description="Translates text between Arabic and English")
+    def translate_text(self, text: str = "") -> str:
+        return f"Translated: {text}"
+
+class DocumentPlugin:
+    @kernel_function(description="Extracts structured data from documents")
+    def extract_document_data(self, document: str = "") -> dict:
+        return {"name": "John Doe", "id": "12345", "doc_type": "Form"}
+
+class FabricPlugin:
+    @kernel_function(description="Stores structured data for analysis")
+    def store_to_fabric(self, data: dict = {}) -> str:
+        return "Data stored in Fabric"
+
+class PowerBIPlugin:
+    @kernel_function(description="Generates Power BI reports")
+    def generate_report(self, data: dict = {}) -> str:
+        return "Power BI Dashboard URL"
+
+
+class PMOPlugin:
+    @kernel_function(description="Logs interaction and triggers workflows")
+    def log_interaction(self, session: str = "") -> str:
+        return "Interaction logged and workflow triggered"
+
+
+# Selection Strategy
+class ContactCenterSelectionStrategy(SequentialSelectionStrategy):
+    async def select_agent(self, agents, history):
+        if not history:
+            return next((a for a in agents if a.name == CALL_CENTER), None)
+
+        last = history[-1]
+        if last.role == AuthorRole.USER:
+            return next((a for a in agents if a.name == CALL_CENTER), None)
+        elif getattr(last, 'name', None) == CALL_CENTER:
+            route = last.content.strip()
+            return next((a for a in agents if a.name == route), None)
+        elif getattr(last, 'name', None) in [DOCUMENT, TRANSLATION]:
+            return next((a for a in agents if a.name == FABRIC), None)
+        elif getattr(last, 'name', None) == FABRIC:
+            return next((a for a in agents if a.name == POWERBI), None)
+        elif getattr(last, 'name', None) == POWERBI:
+            return next((a for a in agents if a.name == PMO), None)
+        elif getattr(last, 'name', None) == PMO:
+            return None  # Stop here
+        elif getattr(last, 'name', None) == GENERAL:
+            return None  # General agent handles the last step
+        return None
+
+
+
+
+# Termination Strategy
+class ContactCenterTerminationStrategy(TerminationStrategy):
+    async def should_agent_terminate(self, agent, history):
+        return any("Interaction logged" in msg.content for msg in history if msg.role == AuthorRole.ASSISTANT)
+
+# Main
 async def main():
-    # Clear the console
-    os.system('cls' if os.name=='nt' else 'clear')
-
-    # Get the log files
-    print("Getting log files...\n")
-    script_dir = Path(__file__).parent  # Get the directory of the script
-    src_path = script_dir / "sample_logs"
-    file_path = script_dir / "logs"
-    shutil.copytree(src_path, file_path, dirs_exist_ok=True)
-
-    # Get the Azure AI Agent settings
+    os.system('cls' if os.name == 'nt' else 'clear')
     ai_agent_settings = AzureAIAgentSettings()
 
     async with (
-        DefaultAzureCredential(exclude_environment_credential=True, 
-            exclude_managed_identity_credential=True) as creds,
+        DefaultAzureCredential(exclude_environment_credential=True, exclude_managed_identity_credential=True) as creds,
         AzureAIAgent.create_client(credential=creds) as client,
     ):
-    
-        # Create the incident manager agent on the Azure AI agent service
-        incident_agent_definition = await client.agents.create_agent(
-            model=ai_agent_settings.model_deployment_name,
-            name=INCIDENT_MANAGER,
-            instructions=INCIDENT_MANAGER_INSTRUCTIONS
-        )
+        agent_defs = [
+            (CALL_CENTER, CALL_CENTER_INSTRUCTIONS, [CallCenterPlugin()]),
+            (TRANSLATION, TRANSLATION_INSTRUCTIONS, [TranslationPlugin()]),
+            (DOCUMENT, DOCUMENT_INSTRUCTIONS, [DocumentPlugin()]),
+            (FABRIC, FABRIC_INSTRUCTIONS, [FabricPlugin()]),
+            (POWERBI, POWERBI_INSTRUCTIONS, [PowerBIPlugin()]),
+            (PMO, PMO_INSTRUCTIONS, [PMOPlugin()]),
+            (GENERAL, GENERAL_INSTRUCTIONS, [GeneralPlugin()]),  
+        ]
 
-        # Create a Semantic Kernel agent for the Azure AI incident manager agent
-        agent_incident = AzureAIAgent(
-            client=client,
-            definition=incident_agent_definition,
-            plugins=[LogFilePlugin()]
-        )
 
-        # Create the devops agent on the Azure AI agent service
-        devops_agent_definition = await client.agents.create_agent(
-            model=ai_agent_settings.model_deployment_name,
-            name=DEVOPS_ASSISTANT,
-            instructions=DEVOPS_ASSISTANT_INSTRUCTIONS,
-        )
+        agents = []
+        for name, instructions, plugins in agent_defs:
+            definition = await client.agents.create_agent(
+                model=ai_agent_settings.model_deployment_name,
+                name=name,
+                instructions=instructions
+            )
+            agents.append(AzureAIAgent(client=client, definition=definition, plugins=plugins))
 
-        # Create a Semantic Kernel agent for the devops Azure AI agent
-        agent_devops = AzureAIAgent(
-            client=client,
-            definition=devops_agent_definition,
-            plugins=[DevopsPlugin()]
-        )
-
-        # Add the agents to a group chat with a custom termination and selection strategy
+        # Orchestrate group chat
         chat = AgentGroupChat(
-            agents=[agent_incident, agent_devops],
-            termination_strategy=ApprovalTerminationStrategy(
-                agents=[agent_incident], 
-                maximum_iterations=10, 
-                automatic_reset=True
-            ),
-            selection_strategy=SelectionStrategy(agents=[agent_incident,agent_devops]),      
+            agents=agents,
+            termination_strategy=ContactCenterTerminationStrategy(),
+            selection_strategy=ContactCenterSelectionStrategy()
         )
 
-         # Process log files
-        for filename in os.listdir(file_path):
-            logfile_msg = ChatMessageContent(role=AuthorRole.USER, content=f"USER > {file_path}/{filename}")
-            await asyncio.sleep(30) # Wait to reduce TPM
-            print(f"\nReady to process log file: {filename}\n")
+        citizen_queries = [
+            "I have a document in Arabic",
+            "Can you translate this to English?",
+            "Where can I find my application status?"
+        ]
 
-
-            # Append the current log file to the chat
-            await chat.add_chat_message(logfile_msg)
-            print()
-
+        for query in citizen_queries:
+            print(f"\nCitizen: {query}")
             try:
-                print()
-
-                # Invoke a response from the agents
-                async for response in chat.invoke():
-                    if response is None or not response.name:
-                        continue
-                    print(f"{response.content}")
-                
+                await chat.add_chat_message(ChatMessageContent(role=AuthorRole.USER, content=query))
             except Exception as e:
-                print(f"Error during chat invocation: {e}")
-                # If TPM rate exceeded, wait 60 secs
-                if "Rate limit is exceeded" in str(e):
-                    print ("Waiting...")
-                    await asyncio.sleep(60)
-                    continue
-                else:
+                print(f"[ERROR] Failed to add message: {e}")
+                continue
+
+            while True:
+                try:
+                    selected_agent = await chat.selection_strategy.select_agent(chat.agents, chat.history)
+                    if selected_agent is None:
+                        break
+
+                    async for response in chat.invoke_agent(selected_agent):
+                        if response and response.content:
+                            name = getattr(response, "name", None) or "UnknownAgent"
+                            print(f"{name}: {response.content}")
+
+                    should_terminate = await chat.termination_strategy.should_agent_terminate(selected_agent, chat.history)
+                    if should_terminate:
+                        break
+
+                except Exception as e:
+                    print(f"[ERROR] Exception during chat: {e}")
                     break
 
+            try:
+                await chat.reset()
+            except Exception as ex:
+                print(f"[WARNING] Could not reset chat: {ex}")
 
 
-# class for selection strategy
-class SelectionStrategy(SequentialSelectionStrategy):
-    """A strategy for determining which agent should take the next turn in the chat."""
-    
-    # Select the next agent that should take the next turn in the chat
-
-    async def select_agent(self, agents, history):
-     """"Check which agent should take the next turn in the chat."""
-
-     # The Incident Manager should go after the User or the Devops Assistant
-     if (history[-1].name == DEVOPS_ASSISTANT or history[-1].role == AuthorRole.USER):
-         agent_name = INCIDENT_MANAGER
-         return next((agent for agent in agents if agent.name == agent_name), None)
-        
-     # Otherwise it is the Devops Assistant's turn
-     return next((agent for agent in agents if agent.name == DEVOPS_ASSISTANT), None)
-
-# class for temination strategy
-class ApprovalTerminationStrategy(TerminationStrategy):
-    """A strategy for determining when an agent should terminate."""
-
-    # End the chat if the agent has indicated there is no action needed
-    async def should_agent_terminate(self, agent, history):
-     """Check if the agent should terminate."""
-     return "no action needed" in history[-1].content.lower()
 
 
-# class for DevOps functions
-class DevopsPlugin:
-    """A plugin that performs developer operation tasks."""
-    
-    def append_to_log_file(self, filepath: str, content: str) -> None:
-        with open(filepath, 'a', encoding='utf-8') as file:
-            file.write('\n' + textwrap.dedent(content).strip())
 
-    @kernel_function(description="A function that restarts the named service")
-    def restart_service(self, service_name: str = "", logfile: str = "") -> str:
-        log_entries = [
-            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ALERT  DevopsAssistant: Multiple failures detected in {service_name}. Restarting service.",
-            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] INFO  {service_name}: Restart initiated.",
-            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] INFO  {service_name}: Service restarted successfully.",
-        ]
-
-        log_message = "\n".join(log_entries)
-        self.append_to_log_file(logfile, log_message)
-        
-        return f"Service {service_name} restarted successfully."
-
-    @kernel_function(description="A function that rollsback the transaction")
-    def rollback_transaction(self, logfile: str = "") -> str:
-        log_entries = [
-            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ALERT  DevopsAssistant: Transaction failure detected. Rolling back transaction batch.",
-            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] INFO   TransactionProcessor: Rolling back transaction batch.",
-            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] INFO   Transaction rollback completed successfully.",
-        ]
-
-        log_message = "\n".join(log_entries)
-        self.append_to_log_file(logfile, log_message)
-        
-        return "Transaction rolled back successfully."
-
-    @kernel_function(description="A function that redeploys the named resource")
-    def redeploy_resource(self, resource_name: str = "", logfile: str = "") -> str:
-        log_entries = [
-            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ALERT  DevopsAssistant: Resource deployment failure detected in '{resource_name}'. Redeploying resource.",
-            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] INFO   DeploymentManager: Redeployment request submitted.",
-            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] INFO   DeploymentManager: Service successfully redeployed, resource '{resource_name}' created successfully.",
-        ]
-
-        log_message = "\n".join(log_entries)
-        self.append_to_log_file(logfile, log_message)
-        
-        return f"Resource '{resource_name}' redeployed successfully."
-
-    @kernel_function(description="A function that increases the quota")
-    def increase_quota(self, logfile: str = "") -> str:
-        log_entries = [
-            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ALERT  DevopsAssistant: High request volume detected. Increasing quota.",
-            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] INFO   APIManager: Quota increase request submitted.",
-            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] INFO   APIManager: Quota successfully increased to 150% of previous limit.",
-        ]
-
-        log_message = "\n".join(log_entries)
-        self.append_to_log_file(logfile, log_message)
-
-        return "Successfully increased quota."
-
-    @kernel_function(description="A function that escalates the issue")
-    def escalate_issue(self, logfile: str = "") -> str:
-        log_entries = [
-            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ALERT  DevopsAssistant: Cannot resolve issue.",
-            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ALERT  DevopsAssistant: Requesting escalation.",
-        ]
-        
-        log_message = "\n".join(log_entries)
-        self.append_to_log_file(logfile, log_message)
-        
-        return "Submitted escalation request."
-
-
-# class for Log File functions
-class LogFilePlugin:
-    """A plugin that reads and writes log files."""
-
-    @kernel_function(description="Accesses the given file path string and returns the file contents as a string")
-    def read_log_file(self, filepath: str = "") -> str:
-        with open(filepath, 'r', encoding='utf-8') as file:
-            return file.read()
-
-
-# Start the app
 if __name__ == "__main__":
     asyncio.run(main())
